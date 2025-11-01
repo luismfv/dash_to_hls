@@ -1,18 +1,43 @@
+# Changelog
+
+## 2025-11-01 - Fixed mp4decrypt stdin/stdout compatibility issues
+
+### Problem
+The mp4decrypt decryption was failing with error: `ERROR: cannot open input file (-) -4`
+
+This was caused by using stdin/stdout pipes (`-` arguments) which have poor or inconsistent support across different versions and platforms of mp4decrypt.
+
+### Solution
+Modified `Mp4DecryptBinary.decrypt_segment()` in `src/dash2hls/decryptor.py` to use temporary files instead:
+- Creates a temporary directory for each decryption operation
+- Writes encrypted data to a temp file
+- Calls mp4decrypt with file paths (not pipes)
+- Reads decrypted data from the output file
+- Cleans up temporary files automatically
+
+### Benefits
+- **Better compatibility**: Works with all versions of mp4decrypt
+- **More reliable**: No pipe synchronization issues
+- **Better error handling**: Can validate output file existence and size
+- **Industry standard**: Matches approach used by production tools like unshackle-dl
+
+---
+
 # Implementation Summary: Multi-Variant HLS with Real-Time Decryption
 
 ## Overview
 This implementation adds three major features to the dash2hls project:
 
-1. **Real-time mp4decrypt decryption** using stdin/stdout pipes
+1. **mp4decrypt decryption** support with proper error handling
 2. **Automatic highest quality video + audio selection** (no subtitles)
 3. **Bootstrap-based web UI** for managing lives
 
 ## Changes Made
 
-### 1. Real-Time mp4decrypt Decryption (decryptor.py)
-- **Before**: mp4decrypt used temporary files for input/output
-- **After**: Uses stdin/stdout pipes (`-` flag) for truly real-time streaming decryption
-- **Benefit**: Eliminates disk I/O overhead, faster processing, no temporary file cleanup
+### 1. mp4decrypt Decryption Support (decryptor.py)
+- **Implementation**: Uses temporary files for input/output to ensure compatibility
+- **Process**: Encrypted data → temp file → mp4decrypt → decrypted file → bytes
+- **Benefit**: Reliable decryption across all platforms and mp4decrypt versions
 
 ### 2. Multi-Variant HLS Support (hls_writer.py, hls_generator.py)
 - **New Class**: `MultiVariantHLSWriter` manages separate video + audio variants
@@ -100,7 +125,7 @@ Each stream now creates:
 - Existing single-representation logic still works for edge cases
 
 ## Benefits
-1. **Better performance**: Real-time decryption with stdin/stdout
+1. **Reliable decryption**: Uses file-based approach that works across all platforms
 2. **Higher quality**: Always selects best video and audio
 3. **Better UX**: Web UI makes management much easier
 4. **Industry standard**: Multi-variant HLS is the proper way to do HLS streaming
