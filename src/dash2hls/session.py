@@ -13,7 +13,7 @@ import aiohttp
 from .dash_parser import DashManifest, DashParser, DashRepresentation, DashSegment
 from .decryptor import DecryptionError, build_decryptor
 from .downloader import SegmentDownloader
-from .hls_writer import HLSWriter
+from .hls_writer import HLSWriter, MultiVariantHLSWriter
 from .models import StreamConfig, StreamInfo, StreamStatus
 
 logger = logging.getLogger(__name__)
@@ -35,14 +35,14 @@ class StreamSession:
         self._decryptor = None
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._representation: Optional[DashRepresentation] = None
-        self._hls_writer: Optional[HLSWriter] = None
-        self._init_written = False
+        self._video_representation: Optional[DashRepresentation] = None
+        self._audio_representation: Optional[DashRepresentation] = None
+        self._hls_writer: Optional[MultiVariantHLSWriter] = None
 
         self._history_limit = self.config.history_size or 128
-        self._processed_numbers: Deque[int] = deque()
-        self._processed_set: set[int] = set()
-        self._last_sequence: Optional[int] = None
+        self._processed_numbers: dict[str, Deque[int]] = {}
+        self._processed_set: dict[str, set[int]] = {}
+        self._last_sequences: dict[str, Optional[int]] = {}
 
     async def start(self) -> None:
         """Start background processing."""
@@ -81,8 +81,19 @@ class StreamSession:
     def info(self) -> StreamInfo:
         """Return current information for this session."""
         resolution = None
-        if self._representation and self._representation.width and self._representation.height:
-            resolution = (self._representation.width, self._representation.height)
+        if self._video_representation and self._video_representation.width and self._video_representation.height:
+            resolution = (self._video_representation.width, self._video_representation.height)
+
+        video_bandwidth = self._video_representation.bandwidth if self._video_representation else None
+        audio_bandwidth = self._audio_representation.bandwidth if self._audio_representation else None
+
+        video_codecs = self._video_representation.codecs if self._video_representation else None
+        audio_codecs = self._audio_representation.codecs if self._audio_representation else None
+        codecs = video_codecs or audio_codecs
+
+        last_sequence = self._last_sequences.get("video")
+        if last_sequence is None:
+            last_sequence = self._last_sequences.get("audio")
 
         return StreamInfo(
             stream_id=self.id,
@@ -91,13 +102,16 @@ class StreamSession:
             hls_url=f"/hls/{self.id}/master.m3u8",
             output_dir=self.output_dir,
             is_live=self.is_live,
-            representation_id=self._representation.id if self._representation else None,
-            bandwidth=self._representation.bandwidth if self._representation else None,
-            codecs=self._representation.codecs if self._representation else None,
+            representation_id=self._video_representation.id if self._video_representation else None,
+            bandwidth=video_bandwidth,
+            codecs=codecs,
             resolution=resolution,
             error=self.error,
             label=self.config.label,
-            last_sequence=self._last_sequence,
+            last_sequence=last_sequence,
+            audio_representation_id=self._audio_representation.id if self._audio_representation else None,
+            audio_bandwidth=audio_bandwidth,
+            audio_codecs=audio_codecs,
         )
 
     async def _run_loop(self) -> None:
@@ -125,36 +139,62 @@ class StreamSession:
                 self.is_live = manifest.is_live
 
                 if self._hls_writer is None:
-                    self._hls_writer = HLSWriter(
+                    self._hls_writer = MultiVariantHLSWriter(
                         self.output_dir,
                         is_live=self.is_live,
                         window_size=self.config.window_size,
                     )
 
-                representation = self._select_representation(manifest)
-                if representation is None:
-                    self._record_error("No matching representation in manifest")
+                video_rep, audio_rep = self._select_representations(manifest)
+                if video_rep is None and audio_rep is None:
+                    self._record_error("No matching video or audio representation in manifest")
                     await self._sleep(self.config.poll_interval)
                     continue
 
-                self._representation = representation
+                self._video_representation = video_rep
+                self._audio_representation = audio_rep
 
                 try:
-                    await self._ensure_initialisation(downloader, representation)
-                    new_segments = self._collect_new_segments(representation.segments)
-                    if new_segments:
-                        await self._process_segments(downloader, representation, new_segments)
+                    await self._ensure_initialisation(downloader, video_rep, audio_rep)
+                    
+                    video_new_segments = []
+                    audio_new_segments = []
+                    
+                    if video_rep:
+                        video_new_segments = self._collect_new_segments(video_rep.segments, track="video")
+                    if audio_rep:
+                        audio_new_segments = self._collect_new_segments(audio_rep.segments, track="audio")
+                    
+                    if video_new_segments or audio_new_segments:
+                        await self._process_multivariant_segments(
+                            downloader, video_rep, audio_rep, video_new_segments, audio_new_segments
+                        )
                         self.status = StreamStatus.RUNNING
                     else:
                         logger.debug("No new segments for stream %s", self.id)
 
-                    if not manifest.is_live and representation.segments:
-                        last_manifest_sequence = representation.segments[-1].number
-                        if (
-                            last_manifest_sequence is not None
-                            and self._last_sequence is not None
-                            and self._last_sequence >= last_manifest_sequence
-                        ):
+                    if not manifest.is_live:
+                        video_complete = True
+                        audio_complete = True
+
+                        video_last_seq = self._last_sequences.get("video")
+                        audio_last_seq = self._last_sequences.get("audio")
+
+                        if video_rep and video_rep.segments:
+                            last_video_sequence = video_rep.segments[-1].number
+                            if last_video_sequence is not None:
+                                video_complete = (
+                                    video_last_seq is not None and video_last_seq >= last_video_sequence
+                                )
+
+                        if audio_rep and audio_rep.segments:
+                            last_audio_sequence = audio_rep.segments[-1].number
+                            if last_audio_sequence is not None:
+                                audio_complete = (
+                                    audio_last_seq is not None and audio_last_seq >= last_audio_sequence
+                                )
+
+                        if video_complete and audio_complete:
                             if self._hls_writer:
                                 self._hls_writer.finalize()
                             self.status = StreamStatus.COMPLETED
@@ -171,33 +211,77 @@ class StreamSession:
         if self.status not in (StreamStatus.ERROR, StreamStatus.COMPLETED):
             self.status = StreamStatus.STOPPED
 
-    async def _ensure_initialisation(self, downloader: SegmentDownloader, representation: DashRepresentation) -> None:
-        if self._init_written:
-            return
-
-        logger.info("Downloading init segment for stream %s", self.id)
-        init_payload = await downloader.download(representation.init_url)
-        decrypted = await self._decrypt_segment(init_payload, representation.default_kid)
+    async def _ensure_initialisation(
+        self,
+        downloader: SegmentDownloader,
+        video_representation: Optional[DashRepresentation],
+        audio_representation: Optional[DashRepresentation],
+    ) -> None:
         if not self._hls_writer:
             raise RuntimeError("HLS writer not initialised")
-        self._hls_writer.write_init(decrypted)
 
-        resolution = None
-        if representation.width and representation.height:
-            resolution = (representation.width, representation.height)
+        if video_representation:
+            resolution = None
+            if video_representation.width and video_representation.height:
+                resolution = (video_representation.width, video_representation.height)
 
-        self._hls_writer.write_master_playlist(
-            bandwidth=representation.bandwidth,
-            codecs=representation.codecs,
-            resolution=resolution,
-            audio=not representation.is_video,
-        )
+            video_state = self._hls_writer.ensure_variant(
+                "video",
+                track_type="video",
+                bandwidth=video_representation.bandwidth,
+                codecs=video_representation.codecs,
+                resolution=resolution,
+            )
 
-        self._init_written = True
-        logger.info("Init segment written for stream %s", self.id)
+            if not video_state.init_written:
+                logger.info("Downloading video init segment for stream %s", self.id)
+                init_payload = await downloader.download(video_representation.init_url)
+                decrypted = await self._decrypt_segment(init_payload, video_representation.default_kid)
+                self._hls_writer.write_init("video", decrypted)
+                logger.info("Video init segment written for stream %s", self.id)
 
-    async def _process_segments(
+        if audio_representation:
+            audio_state = self._hls_writer.ensure_variant(
+                "audio",
+                track_type="audio",
+                bandwidth=audio_representation.bandwidth,
+                codecs=audio_representation.codecs,
+            )
+
+            if not audio_state.init_written:
+                logger.info("Downloading audio init segment for stream %s", self.id)
+                init_payload = await downloader.download(audio_representation.init_url)
+                decrypted = await self._decrypt_segment(init_payload, audio_representation.default_kid)
+                self._hls_writer.write_init("audio", decrypted)
+                logger.info("Audio init segment written for stream %s", self.id)
+
+    async def _process_multivariant_segments(
         self,
+        downloader: SegmentDownloader,
+        video_representation: Optional[DashRepresentation],
+        audio_representation: Optional[DashRepresentation],
+        video_segments: list[DashSegment],
+        audio_segments: list[DashSegment],
+    ) -> None:
+        if video_representation and video_segments:
+            await self._process_track_segments(
+                track="video",
+                downloader=downloader,
+                representation=video_representation,
+                segments=video_segments,
+            )
+
+        if audio_representation and audio_segments:
+            await self._process_track_segments(
+                track="audio",
+                downloader=downloader,
+                representation=audio_representation,
+                segments=audio_segments,
+            )
+
+    async def _process_track_segments(
+        self,
+        track: str,
         downloader: SegmentDownloader,
         representation: DashRepresentation,
         segments: list[DashSegment],
@@ -212,50 +296,67 @@ class StreamSession:
             if not self._hls_writer:
                 raise RuntimeError("HLS writer not initialised")
 
-            self._hls_writer.add_segment(segment.number, segment.duration, decrypted)
-            self._mark_processed(segment.number)
-            self._last_sequence = segment.number
+            self._hls_writer.add_segment(track, segment.number, segment.duration, decrypted)
+            self._mark_processed(track, segment.number)
+            self._last_sequences[track] = segment.number
 
-            logger.debug("Processed segment %s for stream %s", segment.number, self.id)
+            logger.debug("Processed %s segment %s for stream %s", track, segment.number, self.id)
 
-    def _collect_new_segments(self, segments: list[DashSegment]) -> list[DashSegment]:
+    def _ensure_track_state(self, track: str) -> tuple[Deque[int], set[int]]:
+        if track not in self._processed_numbers:
+            self._processed_numbers[track] = deque()
+            self._processed_set[track] = set()
+            self._last_sequences[track] = None
+        return self._processed_numbers[track], self._processed_set[track]
+
+    def _collect_new_segments(self, segments: list[DashSegment], *, track: str) -> list[DashSegment]:
+        numbers, processed_set = self._ensure_track_state(track)
+        last_sequence = self._last_sequences.get(track)
+
         fresh: list[DashSegment] = []
         for segment in segments:
             number = segment.number
             if number is None:
                 continue
-            if number in self._processed_set:
+            if number in processed_set:
                 continue
-            if self._last_sequence is not None and number <= self._last_sequence:
+            if last_sequence is not None and number <= last_sequence:
                 continue
             fresh.append(segment)
         return fresh
 
-    def _mark_processed(self, number: int) -> None:
-        if number in self._processed_set:
+    def _mark_processed(self, track: str, number: int) -> None:
+        numbers, processed_set = self._ensure_track_state(track)
+        if number in processed_set:
             return
-        self._processed_set.add(number)
-        self._processed_numbers.append(number)
+        processed_set.add(number)
+        numbers.append(number)
 
-        while len(self._processed_numbers) > self._history_limit:
-            oldest = self._processed_numbers.popleft()
-            self._processed_set.discard(oldest)
+        while len(numbers) > self._history_limit:
+            oldest = numbers.popleft()
+            processed_set.discard(oldest)
 
-    def _select_representation(self, manifest: DashManifest) -> Optional[DashRepresentation]:
+    def _select_representations(
+        self, manifest: DashManifest
+    ) -> tuple[Optional[DashRepresentation], Optional[DashRepresentation]]:
+        video_representation: Optional[DashRepresentation] = None
+        audio_representation: Optional[DashRepresentation] = None
+
         if self.config.representation_id:
             for rep in manifest.representations:
                 if rep.id == self.config.representation_id:
-                    return rep
-            return None
+                    video_representation = rep
+                    break
+        else:
+            video_reps = [rep for rep in manifest.representations if rep.is_video]
+            if video_reps:
+                video_representation = max(video_reps, key=lambda rep: rep.bandwidth or 0)
 
-        video_reps = [rep for rep in manifest.representations if rep.is_video]
-        if video_reps:
-            return max(video_reps, key=lambda rep: rep.bandwidth)
+        audio_reps = [rep for rep in manifest.representations if rep.is_audio]
+        if audio_reps:
+            audio_representation = max(audio_reps, key=lambda rep: rep.bandwidth or 0)
 
-        if manifest.representations:
-            return max(manifest.representations, key=lambda rep: rep.bandwidth)
-
-        return None
+        return video_representation, audio_representation
 
     async def _decrypt_segment(self, payload: bytes, kid: Optional[str]) -> bytes:
         if not self._decryptor:

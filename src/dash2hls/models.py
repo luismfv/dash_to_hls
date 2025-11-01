@@ -54,3 +54,6 @@ class StreamInfo:
     error: Optional[str] = None
     label: Optional[str] = None
     last_sequence: Optional[int] = None
+    audio_representation_id: Optional[str] = None
+    audio_bandwidth: Optional[int] = None
+    audio_codecs: Optional[str] = None

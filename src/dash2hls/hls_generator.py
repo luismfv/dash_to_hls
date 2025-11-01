@@ -8,7 +8,7 @@ class HlsGenerator:
     """Generates HLS master and media playlists."""
 
     @staticmethod
-    def generate_master_playlist(variants: List[dict]) -> str:
+    def generate_master_playlist(variants: List[dict], media_entries: Optional[List[dict]] = None) -> str:
         """
         Generate HLS master playlist (#EXTM3U).
         
@@ -18,23 +18,55 @@ class HlsGenerator:
                 - resolution: str (e.g., "1920x1080")
                 - codecs: str
                 - uri: str (relative path to media playlist)
+                - audio_group: str (optional, audio group ID)
+            media_entries: List of media (audio/subtitle) info dicts with keys:
+                - type: str (AUDIO, SUBTITLES, etc.)
+                - group_id: str
+                - name: str
+                - uri: str
+                - default: bool
+                - autoselect: bool
+                - language: str (optional)
                 
         Returns:
             Master playlist content as string
         """
         lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
 
+        if media_entries:
+            for media in media_entries:
+                media_type = media.get("type", "AUDIO")
+                attrs = [
+                    f'TYPE={media_type}',
+                    f'GROUP-ID="{media.get("group_id", "audio")}"',
+                    f'NAME="{media.get("name", "audio")}"',
+                ]
+                if media.get("default"):
+                    attrs.append("DEFAULT=YES")
+                if media.get("autoselect"):
+                    attrs.append("AUTOSELECT=YES")
+                if media.get("language"):
+                    attrs.append(f'LANGUAGE="{media["language"]}"')
+                if media.get("uri"):
+                    attrs.append(f'URI="{media["uri"]}"')
+
+                attrs_str = ",".join(attrs)
+                lines.append(f"#EXT-X-MEDIA:{attrs_str}")
+
         for variant in variants:
             bandwidth = variant.get("bandwidth", 0)
             resolution = variant.get("resolution")
             codecs = variant.get("codecs", "")
             uri = variant.get("uri", "")
+            audio_group = variant.get("audio_group")
 
             attrs = [f"BANDWIDTH={bandwidth}"]
             if resolution:
                 attrs.append(f"RESOLUTION={resolution}")
             if codecs:
                 attrs.append(f'CODECS="{codecs}"')
+            if audio_group:
+                attrs.append(f'AUDIO="{audio_group}"')
 
             attrs_str = ",".join(attrs)
             lines.append(f"#EXT-X-STREAM-INF:{attrs_str}")

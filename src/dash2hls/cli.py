@@ -165,6 +165,12 @@ def list_streams(server):
                     click.echo(f"  Label: {stream['label']}")
                 if stream.get("last_sequence") is not None:
                     click.echo(f"  Last Sequence: {stream['last_sequence']}")
+                if stream.get("audio_representation_id"):
+                    click.echo(f"  Audio Representation: {stream['audio_representation_id']}")
+                if stream.get("audio_bandwidth"):
+                    click.echo(f"  Audio Bandwidth: {stream['audio_bandwidth']} bps")
+                if stream.get("audio_codecs"):
+                    click.echo(f"  Audio Codecs: {stream['audio_codecs']}")
                 if stream.get("error"):
                     click.echo(f"  Error: {stream['error']}")
                 click.echo()
@@ -203,6 +209,12 @@ def get_stream(stream_id, server):
                 click.echo(f"Label: {stream['label']}")
             if stream.get("last_sequence") is not None:
                 click.echo(f"Last Sequence: {stream['last_sequence']}")
+            if stream.get("audio_representation_id"):
+                click.echo(f"Audio Representation: {stream['audio_representation_id']}")
+            if stream.get("audio_bandwidth"):
+                click.echo(f"Audio Bandwidth: {stream['audio_bandwidth']} bps")
+            if stream.get("audio_codecs"):
+                click.echo(f"Audio Codecs: {stream['audio_codecs']}")
             if stream.get("error"):
                 click.echo(f"Error: {stream['error']}")
         except Exception as exc:
