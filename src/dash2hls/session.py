@@ -235,10 +235,15 @@ class StreamSession:
 
             if not video_state.init_written:
                 logger.info("Downloading video init segment for stream %s", self.id)
-                init_payload = await downloader.download(video_representation.init_url)
-                decrypted = await self._decrypt_segment(init_payload, video_representation.default_kid)
-                self._hls_writer.write_init("video", decrypted)
-                logger.info("Video init segment written for stream %s", self.id)
+                try:
+                    init_payload = await self._download_segment_with_validation(
+                        downloader, video_representation.init_url, "video init"
+                    )
+                    decrypted = await self._decrypt_segment(init_payload, video_representation.default_kid)
+                    self._hls_writer.write_init("video", decrypted)
+                    logger.info("Video init segment written for stream %s", self.id)
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to download/decrypt video init segment: {exc}")
 
         if audio_representation:
             audio_state = self._hls_writer.ensure_variant(
@@ -250,10 +255,15 @@ class StreamSession:
 
             if not audio_state.init_written:
                 logger.info("Downloading audio init segment for stream %s", self.id)
-                init_payload = await downloader.download(audio_representation.init_url)
-                decrypted = await self._decrypt_segment(init_payload, audio_representation.default_kid)
-                self._hls_writer.write_init("audio", decrypted)
-                logger.info("Audio init segment written for stream %s", self.id)
+                try:
+                    init_payload = await self._download_segment_with_validation(
+                        downloader, audio_representation.init_url, "audio init"
+                    )
+                    decrypted = await self._decrypt_segment(init_payload, audio_representation.default_kid)
+                    self._hls_writer.write_init("audio", decrypted)
+                    logger.info("Audio init segment written for stream %s", self.id)
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to download/decrypt audio init segment: {exc}")
 
     async def _process_multivariant_segments(
         self,
@@ -290,17 +300,25 @@ class StreamSession:
             if self._stop_event.is_set():
                 break
 
-            payload = await downloader.download(segment.url)
-            decrypted = await self._decrypt_segment(payload, representation.default_kid)
+            try:
+                payload = await self._download_segment_with_validation(
+                    downloader, segment.url, f"{track} segment {segment.number}"
+                )
+                decrypted = await self._decrypt_segment(payload, representation.default_kid)
 
-            if not self._hls_writer:
-                raise RuntimeError("HLS writer not initialised")
+                if not self._hls_writer:
+                    raise RuntimeError("HLS writer not initialised")
 
-            self._hls_writer.add_segment(track, segment.number, segment.duration, decrypted)
-            self._mark_processed(track, segment.number)
-            self._last_sequences[track] = segment.number
+                self._hls_writer.add_segment(track, segment.number, segment.duration, decrypted)
+                self._mark_processed(track, segment.number)
+                self._last_sequences[track] = segment.number
 
-            logger.debug("Processed %s segment %s for stream %s", track, segment.number, self.id)
+                logger.debug("Processed %s segment %s for stream %s", track, segment.number, self.id)
+            except Exception as exc:
+                logger.error("Failed to process %s segment %s for stream %s: %s", 
+                           track, segment.number, self.id, exc)
+                # Continue with other segments instead of failing completely
+                continue
 
     def _ensure_track_state(self, track: str) -> tuple[Deque[int], set[int]]:
         if track not in self._processed_numbers:
@@ -357,6 +375,41 @@ class StreamSession:
             audio_representation = max(audio_reps, key=lambda rep: rep.bandwidth or 0)
 
         return video_representation, audio_representation
+
+    async def _download_segment_with_validation(
+        self, downloader: SegmentDownloader, url: str, description: str
+    ) -> bytes:
+        """Download a segment with validation and logging."""
+        logger.debug("Downloading %s: %s", description, url)
+        
+        try:
+            payload = await downloader.download(url)
+            
+            if not payload:
+                raise ValueError(f"Downloaded empty payload for {description}")
+            
+            logger.debug("Downloaded %d bytes for %s", len(payload), description)
+            
+            # Basic validation for MP4 segments
+            if len(payload) < 8:
+                raise ValueError(f"Downloaded payload too small for {description}: {len(payload)} bytes")
+            
+            # Check if it looks like an MP4 file (should contain 'ftyp' box)
+            # The 'ftyp' box is usually at offset 4, but can be at offset 0 in some cases
+            is_mp4 = (
+                payload.startswith(b'ftyp') or 
+                (len(payload) >= 8 and payload[4:8] == b'ftyp')
+            )
+            
+            if not is_mp4:
+                logger.warning("Downloaded %s data does not appear to be MP4 format (first 100 bytes: %s)", 
+                            description, payload[:100].hex())
+            
+            return payload
+            
+        except Exception as exc:
+            logger.error("Failed to download %s: %s", description, exc)
+            raise
 
     async def _decrypt_segment(self, payload: bytes, kid: Optional[str]) -> bytes:
         if not self._decryptor:

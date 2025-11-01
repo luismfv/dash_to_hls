@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, Optional, Protocol
+
+logger = logging.getLogger(__name__)
 
 
 class DecryptionError(RuntimeError):
@@ -57,6 +62,13 @@ class Mp4DecryptBinary(Decryptor):
         return key
 
     async def decrypt_segment(self, data: bytes, *, kid: Optional[str] = None) -> bytes:
+        # Validate input data
+        if not data:
+            raise DecryptionError("No data provided for decryption")
+        
+        if len(data) < 8:  # MP4 files should have at least 8 bytes for the header
+            raise DecryptionError(f"Data too small for MP4 file: {len(data)} bytes")
+
         if kid:
             kid = self._normalize_kid(kid)
             if kid not in self.key_map:
@@ -70,6 +82,20 @@ class Mp4DecryptBinary(Decryptor):
 
         key = self.key_map[kid]
 
+        # Try stdin/stdout first, fallback to temp files if that fails
+        try:
+            return await self._decrypt_via_stdin(data, kid, key)
+        except DecryptionError as exc:
+            error_str = str(exc)
+            # Check for specific stdin-related errors
+            if "cannot open input file" in error_str or "cannot stat '-'" in error_str:
+                # Fallback to temp file method if stdin fails
+                logger.warning(f"Stdin method failed, falling back to temp file method: {exc}")
+                return await self._decrypt_via_tempfile(data, kid, key)
+            raise
+
+    async def _decrypt_via_stdin(self, data: bytes, kid: str, key: str) -> bytes:
+        """Decrypt using stdin/stdout pipes."""
         command = [
             self.executable,
             "--key",
@@ -78,28 +104,95 @@ class Mp4DecryptBinary(Decryptor):
             "-",
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate(input=data)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate(input=data)
+        except Exception as exc:
+            raise DecryptionError(f"Failed to execute mp4decrypt: {exc}")
 
         if process.returncode != 0:
+            stderr_text = stderr.decode(errors='ignore').strip()
+            stdout_text = stdout.decode(errors='ignore').strip()
+            
             raise DecryptionError(
                 f"mp4decrypt failed (exit code {process.returncode}).\n"
-                f"STDOUT: {stdout.decode(errors='ignore')}\n"
-                f"STDERR: {stderr.decode(errors='ignore')}"
+                f"Input data size: {len(data)} bytes\n"
+                f"First 100 bytes (hex): {data[:100].hex()}\n"
+                f"STDOUT: {stdout_text}\n"
+                f"STDERR: {stderr_text}"
             )
 
         if not stdout:
-            stderr_text = stderr.decode(errors="ignore")
+            stderr_text = stderr.decode(errors="ignore").strip()
             raise DecryptionError(
-                "mp4decrypt produced no output" + (f". STDERR: {stderr_text}" if stderr_text else "")
+                f"mp4decrypt produced no output. Input data size: {len(data)} bytes" + 
+                (f". STDERR: {stderr_text}" if stderr_text else "")
             )
 
         return stdout
+
+    async def _decrypt_via_tempfile(self, data: bytes, kid: str, key: str) -> bytes:
+        """Decrypt using temporary files as fallback."""
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as input_file:
+            input_file.write(data)
+            input_path = input_file.name
+        
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as output_file:
+            output_path = output_file.name
+
+        try:
+            command = [
+                self.executable,
+                "--key",
+                f"{kid}:{key}",
+                input_path,
+                output_path,
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                stderr_text = stderr.decode(errors='ignore').strip()
+                stdout_text = stdout.decode(errors='ignore').strip()
+                
+                raise DecryptionError(
+                    f"mp4decrypt failed with temp file method (exit code {process.returncode}).\n"
+                    f"Input file: {input_path}\n"
+                    f"Output file: {output_path}\n"
+                    f"Input data size: {len(data)} bytes\n"
+                    f"STDOUT: {stdout_text}\n"
+                    f"STDERR: {stderr_text}"
+                )
+
+            # Read the decrypted data from the output file
+            try:
+                with open(output_path, 'rb') as f:
+                    decrypted_data = f.read()
+                
+                if not decrypted_data:
+                    raise DecryptionError("mp4decrypt produced empty output file")
+                
+                return decrypted_data
+            except Exception as exc:
+                raise DecryptionError(f"Failed to read decrypted output file: {exc}")
+
+        finally:
+            # Clean up temporary files
+            try:
+                os.unlink(input_path)
+                os.unlink(output_path)
+            except Exception:
+                pass
 
 
 def build_decryptor(

@@ -377,6 +377,13 @@ class DashParser:
             duration_units = template.duration
             timescale = template.timescale or 1
             segment_duration = duration_units / timescale
+            
+            # Ensure we have valid parameters
+            if segment_duration <= 0:
+                # Fallback to reasonable default if duration is invalid
+                segment_duration = 4.0  # 4 seconds default
+                duration_units = int(segment_duration * timescale)
+            
             if total_duration and segment_duration > 0:
                 estimate = math.ceil(total_duration / segment_duration)
                 num_segments = max(1, estimate)
@@ -395,9 +402,15 @@ class DashParser:
                 )
                 if not media_path:
                     break
+                    
+                segment_url = DashParser._resolve_url(base_url, media_path)
+                # Validate that we got a proper URL
+                if not segment_url or not segment_url.startswith(('http://', 'https://')):
+                    continue
+                    
                 segments.append(
                     DashSegment(
-                        url=DashParser._resolve_url(base_url, media_path),
+                        url=segment_url,
                         duration=segment_duration,
                         number=seg_number,
                     )
