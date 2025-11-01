@@ -25,8 +25,7 @@ def cli():
 
 @cli.command()
 @click.option("--mpd-url", required=True, help="URL of the DASH MPD manifest")
-@click.option("--key", help="Decryption key (hex string)")
-@click.option("--kid", help="Key ID (hex string)")
+@click.option("--key", help="Decryption key as KID:KEY (hex string)")
 @click.option(
     "--key-map",
     multiple=True,
@@ -44,7 +43,6 @@ def cli():
 def add_stream(
     mpd_url,
     key,
-    kid,
     key_map,
     representation_id,
     label,
@@ -61,10 +59,14 @@ def add_stream(
         "mpd_url": mpd_url,
     }
 
+    # Parse key as KID:KEY format
     if key:
-        payload["key"] = key
-    if kid:
-        payload["kid"] = kid
+        if ":" in key:
+            kid_part, key_part = key.split(":", 1)
+            payload["kid"] = kid_part.strip()
+            payload["key"] = key_part.strip()
+        else:
+            raise click.BadParameter("--key must be in the form KID:KEY")
 
     if key_map:
         key_map_dict = {}
