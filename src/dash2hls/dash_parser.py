@@ -1,16 +1,19 @@
 """Parse DASH MPD manifests and extract segment information."""
 
+from __future__ import annotations
+
 import math
 import re
 from dataclasses import dataclass
 from typing import List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from lxml import etree
 
 
 @dataclass
 class DashSegment:
     """Represents a single DASH segment."""
+
     url: str
     duration: float
     number: int
@@ -19,6 +22,7 @@ class DashSegment:
 @dataclass
 class DashRepresentation:
     """Represents a DASH representation (quality level)."""
+
     id: str
     bandwidth: int
     codecs: str
@@ -35,6 +39,7 @@ class DashRepresentation:
 @dataclass
 class DashManifest:
     """Parsed DASH manifest information."""
+
     base_url: str
     media_presentation_duration: Optional[float]
     representations: List[DashRepresentation]
@@ -42,285 +47,606 @@ class DashManifest:
     min_update_period: Optional[float]
 
 
+@dataclass
+class _ResolvedSegmentTemplate:
+    """Helpers for resolved SegmentTemplate attributes."""
+
+    initialization: Optional[str]
+    media: Optional[str]
+    timescale: int
+    duration: Optional[int]
+    start_number: int
+    presentation_time_offset: int
+    timeline: Optional[etree._Element]
+
+
 class DashParser:
     """Parser for DASH MPD manifests."""
 
     DASH_NS = {
-        'mpd': 'urn:mpeg:dash:schema:mpd:2011',
-        'cenc': 'urn:mpeg:cenc:2013',
+        "mpd": "urn:mpeg:dash:schema:mpd:2011",
+        "cenc": "urn:mpeg:cenc:2013",
     }
+
+    FALLBACK_SEGMENT_COUNT = 200
+    MAX_TIMELINE_REPEAT = 30
 
     @staticmethod
     def parse(mpd_content: str, mpd_url: str) -> DashManifest:
-        """
-        Parse MPD manifest content.
-        
-        Args:
-            mpd_content: XML content of the MPD
-            mpd_url: URL of the MPD (for resolving relative URLs)
-            
-        Returns:
-            Parsed DashManifest object
-        """
-        root = etree.fromstring(mpd_content.encode('utf-8'))
-        
-        base_url = mpd_url.rsplit('/', 1)[0] + '/'
-        base_url_elem = root.find('.//mpd:BaseURL', namespaces=DashParser.DASH_NS)
-        if base_url_elem is not None and base_url_elem.text:
-            base_url = urljoin(base_url, base_url_elem.text.strip())
+        """Parse MPD manifest content."""
+        root = etree.fromstring(mpd_content.encode("utf-8"))
 
-        mpd_type = root.get('type', 'static').lower()
-        is_live = mpd_type == 'dynamic'
+        mpd_dir = DashParser._base_dir(mpd_url)
+        manifest_base = DashParser._apply_base_url(mpd_dir, root)
 
-        duration_str = root.get('mediaPresentationDuration')
-        media_duration = DashParser._parse_duration(duration_str) if duration_str else None
+        mpd_type = (root.get("type", "static") or "static").lower()
+        is_live = mpd_type == "dynamic"
 
-        min_update_str = root.get('minimumUpdatePeriod')
-        min_update = DashParser._parse_duration(min_update_str) if min_update_str else None
+        duration_str = root.get("mediaPresentationDuration")
+        media_duration = (
+            DashParser._parse_duration(duration_str) if duration_str else None
+        )
 
-        representations = []
-        
-        for period in root.findall('.//mpd:Period', namespaces=DashParser.DASH_NS):
-            period_duration = DashParser._parse_duration(period.get('duration')) if period.get('duration') else None
+        min_update_str = root.get("minimumUpdatePeriod")
+        min_update = (
+            DashParser._parse_duration(min_update_str) if min_update_str else None
+        )
 
-            for adaptation_set in period.findall('.//mpd:AdaptationSet', namespaces=DashParser.DASH_NS):
-                mime_type = adaptation_set.get('mimeType', '')
-                codecs = adaptation_set.get('codecs', '')
-                
-                is_video = 'video' in mime_type
-                is_audio = 'audio' in mime_type
-                
-                for representation in adaptation_set.findall('.//mpd:Representation', namespaces=DashParser.DASH_NS):
-                    rep_id = representation.get('id')
-                    bandwidth = int(representation.get('bandwidth', 0))
+        representations: List[DashRepresentation] = []
 
-                    rep_mime = representation.get('mimeType', mime_type)
-                    rep_codecs = representation.get('codecs', codecs)
-                    width = representation.get('width')
-                    height = representation.get('height')
+        for period in root.findall("./mpd:Period", namespaces=DashParser.DASH_NS):
+            period_duration = (
+                DashParser._parse_duration(period.get("duration"))
+                if period.get("duration")
+                else None
+            )
+            period_base = DashParser._apply_base_url(manifest_base, period)
 
-                    if width:
-                        width = int(width)
-                    if height:
-                        height = int(height)
+            for adaptation_set in period.findall(
+                "./mpd:AdaptationSet", namespaces=DashParser.DASH_NS
+            ):
+                if DashParser._skip_adaptation_set(adaptation_set):
+                    continue
 
-                    default_kid = DashParser._resolve_default_kid(adaptation_set, representation)
+                adaptation_base = DashParser._apply_base_url(period_base, adaptation_set)
 
-                    segment_template = representation.find('.//mpd:SegmentTemplate', namespaces=DashParser.DASH_NS)
-                    if segment_template is None:
-                        segment_template = adaptation_set.find('.//mpd:SegmentTemplate', namespaces=DashParser.DASH_NS)
+                for representation in adaptation_set.findall(
+                    "./mpd:Representation", namespaces=DashParser.DASH_NS
+                ):
+                    rep_id = representation.get("id") or ""
+                    if not rep_id:
+                        continue
 
-                    if segment_template is not None:
+                    rep_mime = representation.get("mimeType") or adaptation_set.get(
+                        "mimeType", ""
+                    )
+                    rep_codecs = representation.get("codecs") or adaptation_set.get(
+                        "codecs", ""
+                    )
+                    width = DashParser._maybe_int(representation.get("width"))
+                    height = DashParser._maybe_int(representation.get("height"))
+                    bandwidth = DashParser._safe_int(
+                        representation.get("bandwidth"), default=0
+                    )
+
+                    is_video, is_audio = DashParser._classify_track(
+                        adaptation_set, representation
+                    )
+                    if not is_video and not is_audio:
+                        continue
+
+                    default_kid = DashParser._resolve_default_kid(
+                        adaptation_set, representation
+                    )
+
+                    rep_base = DashParser._apply_base_url(adaptation_base, representation)
+
+                    template = DashParser._resolve_segment_template(
+                        [root, period, adaptation_set, representation]
+                    )
+                    segment_list = DashParser._find_first_in_hierarchy(
+                        [representation, adaptation_set, period, root], "SegmentList"
+                    )
+                    segment_base = DashParser._find_first_in_hierarchy(
+                        [representation, adaptation_set, period, root], "SegmentBase"
+                    )
+
+                    init_url: str = ""
+                    segments: List[DashSegment] = []
+
+                    total_duration = period_duration or media_duration
+
+                    if template and template.media:
                         init_url, segments = DashParser._parse_segment_template(
-                            segment_template,
-                            rep_id,
-                            base_url,
-                            bandwidth,
-                            total_duration=period_duration or media_duration,
+                            template,
+                            rep_id=rep_id,
+                            base_url=rep_base,
+                            bandwidth=bandwidth,
+                            total_duration=total_duration,
+                            is_live=is_live,
+                        )
+                    elif segment_list is not None:
+                        init_url, segments = DashParser._parse_segment_list(
+                            segment_list, rep_base
+                        )
+                    elif segment_base is not None:
+                        init_url, segments = DashParser._parse_segment_base(
+                            segment_base, rep_base, total_duration
                         )
                     else:
-                        segment_list = representation.find('.//mpd:SegmentList', namespaces=DashParser.DASH_NS)
-                        if segment_list is None:
-                            segment_list = adaptation_set.find('.//mpd:SegmentList', namespaces=DashParser.DASH_NS)
+                        # Representation without known segment addressing
+                        continue
 
-                        if segment_list is not None:
-                            init_url, segments = DashParser._parse_segment_list(segment_list, base_url)
-                        else:
-                            continue
+                    if not init_url or not segments:
+                        continue
 
-                    rep_obj = DashRepresentation(
-                        id=rep_id,
-                        bandwidth=bandwidth,
-                        codecs=rep_codecs,
-                        mime_type=rep_mime,
-                        width=width,
-                        height=height,
-                        init_url=init_url,
-                        segments=segments,
-                        is_video=is_video,
-                        is_audio=is_audio,
-                        default_kid=default_kid,
+                    representations.append(
+                        DashRepresentation(
+                            id=rep_id,
+                            bandwidth=bandwidth,
+                            codecs=rep_codecs,
+                            mime_type=rep_mime,
+                            width=width,
+                            height=height,
+                            init_url=init_url,
+                            segments=segments,
+                            is_video=is_video,
+                            is_audio=is_audio,
+                            default_kid=default_kid,
+                        )
                     )
-                    representations.append(rep_obj)
 
         return DashManifest(
-            base_url=base_url,
+            base_url=manifest_base,
             media_presentation_duration=media_duration,
             representations=representations,
             is_live=is_live,
-            min_update_period=min_update
+            min_update_period=min_update,
+        )
+
+    # ------------------------------------------------------------------
+    # Helper utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _base_dir(url: str) -> str:
+        if url.endswith("/"):
+            return url
+        if "/" not in url:
+            return url + "/"
+        return url.rsplit("/", 1)[0] + "/"
+
+    @staticmethod
+    def _get_child(element: Optional[etree._Element], tag: str) -> Optional[etree._Element]:
+        if element is None:
+            return None
+        return element.find(f"./mpd:{tag}", namespaces=DashParser.DASH_NS)
+
+    @staticmethod
+    def _apply_base_url(current_base: str, element: Optional[etree._Element]) -> str:
+        if element is None:
+            return current_base
+        base_elem = DashParser._get_child(element, "BaseURL")
+        if base_elem is None or not base_elem.text:
+            return current_base
+        return DashParser._resolve_url(current_base, base_elem.text.strip())
+
+    @staticmethod
+    def _resolve_url(base: str, relative: str) -> str:
+        parsed = urlparse(relative)
+        if parsed.scheme:
+            return relative
+        return urljoin(base, relative)
+
+    @staticmethod
+    def _safe_int(value: Optional[str], default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _maybe_int(value: Optional[str]) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _skip_adaptation_set(adaptation_set: etree._Element) -> bool:
+        content_type = (adaptation_set.get("contentType") or "").lower()
+        mime_type = (adaptation_set.get("mimeType") or "").lower()
+        if content_type and content_type not in {"audio", "video"}:
+            return True
+        if any(text_key in mime_type for text_key in ("text", "ttml", "vtt", "srt")):
+            return True
+        return False
+
+    @staticmethod
+    def _classify_track(
+        adaptation_set: etree._Element, representation: etree._Element
+    ) -> tuple[bool, bool]:
+        mime_candidates = [
+            (representation.get("mimeType") or "").lower(),
+            (adaptation_set.get("mimeType") or "").lower(),
+        ]
+        content_candidates = [
+            (representation.get("contentType") or "").lower(),
+            (adaptation_set.get("contentType") or "").lower(),
+        ]
+
+        is_video = any("video" in value for value in mime_candidates) or any(
+            value == "video" for value in content_candidates
+        )
+        is_audio = any("audio" in value for value in mime_candidates) or any(
+            value == "audio" for value in content_candidates
+        )
+        return is_video, is_audio
+
+    @staticmethod
+    def _resolve_segment_template(
+        elements: List[Optional[etree._Element]],
+    ) -> Optional[_ResolvedSegmentTemplate]:
+        merged: dict[str, str] = {}
+        timeline: Optional[etree._Element] = None
+
+        for element in elements:
+            if element is None:
+                continue
+            template = DashParser._get_child(element, "SegmentTemplate")
+            if template is None:
+                continue
+            merged.update(template.attrib)
+            timeline_candidate = DashParser._get_child(template, "SegmentTimeline")
+            if timeline_candidate is not None:
+                timeline = timeline_candidate
+
+        if not merged and timeline is None:
+            return None
+
+        timescale = DashParser._safe_int(merged.get("timescale"), default=1)
+        duration = DashParser._maybe_int(merged.get("duration"))
+        start_number = DashParser._safe_int(merged.get("startNumber"), default=1)
+        presentation_time_offset = DashParser._safe_int(
+            merged.get("presentationTimeOffset"), default=0
+        )
+
+        return _ResolvedSegmentTemplate(
+            initialization=merged.get("initialization"),
+            media=merged.get("media"),
+            timescale=timescale if timescale > 0 else 1,
+            duration=duration,
+            start_number=start_number,
+            presentation_time_offset=presentation_time_offset,
+            timeline=timeline,
         )
 
     @staticmethod
-    def _resolve_default_kid(adaptation_set, representation) -> Optional[str]:
-        """Extract default_KID from ContentProtection elements."""
+    def _find_first_in_hierarchy(
+        elements: List[Optional[etree._Element]], tag: str
+    ) -> Optional[etree._Element]:
+        for element in elements:
+            found = DashParser._get_child(element, tag)
+            if found is not None:
+                return found
+        return None
+
+    # ------------------------------------------------------------------
+    # Segment parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_segment_template(
+        template: _ResolvedSegmentTemplate,
+        *,
+        rep_id: str,
+        base_url: str,
+        bandwidth: int,
+        total_duration: Optional[float],
+        is_live: bool,
+    ) -> tuple[str, List[DashSegment]]:
+        init_url = ""
+        if template.initialization:
+            init_path = DashParser._fill_template(
+                template.initialization,
+                rep_id=rep_id,
+                number=template.start_number,
+                time=0,
+                bandwidth=bandwidth,
+            )
+            if init_path:
+                init_url = DashParser._resolve_url(base_url, init_path)
+
+        segments: List[DashSegment] = []
+        if not template.media:
+            return init_url, segments
+
+        if template.timeline is not None:
+            segments = DashParser._parse_segment_timeline(
+                template,
+                rep_id=rep_id,
+                base_url=base_url,
+                bandwidth=bandwidth,
+                is_live=is_live,
+            )
+        elif template.duration:
+            duration_units = template.duration
+            timescale = template.timescale or 1
+            segment_duration = duration_units / timescale
+            if total_duration and segment_duration > 0:
+                estimate = math.ceil(total_duration / segment_duration)
+                num_segments = max(1, estimate)
+            else:
+                num_segments = DashParser.FALLBACK_SEGMENT_COUNT
+
+            time_cursor = template.presentation_time_offset
+            for offset in range(num_segments):
+                seg_number = template.start_number + offset
+                media_path = DashParser._fill_template(
+                    template.media,
+                    rep_id=rep_id,
+                    number=seg_number,
+                    time=time_cursor,
+                    bandwidth=bandwidth,
+                )
+                if not media_path:
+                    break
+                segments.append(
+                    DashSegment(
+                        url=DashParser._resolve_url(base_url, media_path),
+                        duration=segment_duration,
+                        number=seg_number,
+                    )
+                )
+                time_cursor += duration_units
+
+        return init_url, segments
+
+    @staticmethod
+    def _parse_segment_timeline(
+        template: _ResolvedSegmentTemplate,
+        *,
+        rep_id: str,
+        base_url: str,
+        bandwidth: int,
+        is_live: bool,
+    ) -> List[DashSegment]:
+        timeline = template.timeline
+        if timeline is None or not template.media:
+            return []
+
+        segments: List[DashSegment] = []
+        timescale = template.timescale or 1
+        number = template.start_number
+        current_time = template.presentation_time_offset
+        last_duration = template.duration
+
+        for s in timeline.findall("./mpd:S", namespaces=DashParser.DASH_NS):
+            if s.get("t") is not None:
+                current_time = DashParser._safe_int(s.get("t"), default=current_time)
+
+            d_value = s.get("d")
+            if d_value is not None:
+                duration_units = DashParser._safe_int(d_value, default=0)
+                last_duration = duration_units if duration_units > 0 else last_duration
+            elif last_duration:
+                duration_units = last_duration
+            else:
+                continue
+
+            if duration_units <= 0:
+                continue
+
+            repeat = DashParser._safe_int(s.get("r"), default=0)
+            if repeat < 0:
+                repeat = DashParser.MAX_TIMELINE_REPEAT if is_live else 0
+
+            for _ in range(repeat + 1):
+                time_value = current_time - template.presentation_time_offset
+                media_path = DashParser._fill_template(
+                    template.media,
+                    rep_id=rep_id,
+                    number=number,
+                    time=time_value,
+                    bandwidth=bandwidth,
+                )
+                if not media_path:
+                    break
+
+                segments.append(
+                    DashSegment(
+                        url=DashParser._resolve_url(base_url, media_path),
+                        duration=duration_units / timescale,
+                        number=number,
+                    )
+                )
+                number += 1
+                current_time += duration_units
+
+        return segments
+
+    @staticmethod
+    def _parse_segment_list(
+        segment_list: etree._Element, base_url: str
+    ) -> tuple[str, List[DashSegment]]:
+        init_url = ""
+        init_elem = DashParser._get_child(segment_list, "Initialization")
+        if init_elem is not None and init_elem.get("sourceURL"):
+            init_url = DashParser._resolve_url(base_url, init_elem.get("sourceURL"))
+
+        timescale = DashParser._safe_int(segment_list.get("timescale"), default=1)
+        default_duration_units = DashParser._maybe_int(segment_list.get("duration"))
+        default_duration = (
+            default_duration_units / timescale
+            if default_duration_units and timescale
+            else None
+        )
+
+        segments: List[DashSegment] = []
+        start_number = DashParser._safe_int(
+            segment_list.get("startNumber"), default=1
+        )
+
+        for idx, seg_elem in enumerate(
+            segment_list.findall("./mpd:SegmentURL", namespaces=DashParser.DASH_NS)
+        ):
+            media_attr = seg_elem.get("media")
+            if not media_attr:
+                continue
+            media_url = DashParser._resolve_url(base_url, media_attr)
+
+            duration_units = DashParser._maybe_int(seg_elem.get("duration"))
+            if duration_units and timescale:
+                duration = duration_units / timescale
+            else:
+                duration = default_duration if default_duration is not None else 0.0
+
+            segments.append(
+                DashSegment(
+                    url=media_url,
+                    duration=duration,
+                    number=start_number + idx,
+                )
+            )
+
+        return init_url, segments
+
+    @staticmethod
+    def _parse_segment_base(
+        segment_base: etree._Element,
+        base_url: str,
+        total_duration: Optional[float],
+    ) -> tuple[str, List[DashSegment]]:
+        init_url = ""
+        init_elem = DashParser._get_child(segment_base, "Initialization")
+        if init_elem is not None and init_elem.get("sourceURL"):
+            init_url = DashParser._resolve_url(base_url, init_elem.get("sourceURL"))
+
+        segments: List[DashSegment] = []
+        if total_duration is not None:
+            segments.append(
+                DashSegment(url=base_url, duration=total_duration, number=1)
+            )
+
+        return init_url, segments
+
+    # ------------------------------------------------------------------
+    # Misc helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fill_template(
+        template: str,
+        *,
+        rep_id: str,
+        number: int,
+        time: int,
+        bandwidth: int,
+    ) -> str:
+        if not template:
+            return ""
+
+        result = template.replace("$$", "\x00")
+        result = result.replace("$RepresentationID$", rep_id)
+        result = result.replace("$Number$", str(number))
+        result = result.replace("$Time$", str(time))
+        result = result.replace("$Bandwidth$", str(bandwidth))
+
+        pattern = r"\$(\w+)%(0?)(\d*)([diouxX])\$"
+
+        def replace(match: re.Match[str]) -> str:
+            var_name, zero_flag, width_str, _ = match.groups()
+            width = int(width_str) if width_str else 0
+            zero_pad = zero_flag == "0"
+
+            value_map = {
+                "Number": number,
+                "Time": time,
+                "Bandwidth": bandwidth,
+            }
+
+            if var_name == "RepresentationID":
+                return rep_id
+
+            value = value_map.get(var_name)
+            if value is None:
+                return match.group(0)
+
+            value_str = str(value)
+            if width > 0:
+                pad_char = "0" if zero_pad else " "
+                value_str = value_str.rjust(width, pad_char)
+            return value_str
+
+        result = re.sub(pattern, replace, result)
+        return result.replace("\x00", "$")
+
+    @staticmethod
+    def _resolve_default_kid(
+        adaptation_set: etree._Element, representation: etree._Element
+    ) -> Optional[str]:
         for element in (representation, adaptation_set):
             if element is None:
                 continue
 
             direct = (
-                element.get('{urn:mpeg:cenc:2013}default_KID')
-                or element.get('cenc:default_KID')
-                or element.get('default_KID')
+                element.get("{urn:mpeg:cenc:2013}default_KID")
+                or element.get("cenc:default_KID")
+                or element.get("default_KID")
             )
             if direct:
-                return direct.replace('-', '').lower()
+                return direct.replace("-", "").lower()
 
-            for cp in element.findall('./mpd:ContentProtection', namespaces=DashParser.DASH_NS):
+            for cp in element.findall(
+                "./mpd:ContentProtection", namespaces=DashParser.DASH_NS
+            ):
                 kid = (
-                    cp.get('{urn:mpeg:cenc:2013}default_KID')
-                    or cp.get('cenc:default_KID')
-                    or cp.get('default_KID')
+                    cp.get("{urn:mpeg:cenc:2013}default_KID")
+                    or cp.get("cenc:default_KID")
+                    or cp.get("default_KID")
                 )
                 if kid:
-                    return kid.replace('-', '').lower()
-
+                    return kid.replace("-", "").lower()
         return None
 
     @staticmethod
-    def _parse_segment_template(
-        template, rep_id: str, base_url: str, bandwidth: int, total_duration: Optional[float] = None
-    ) -> tuple:
-        """Parse SegmentTemplate element."""
-        init_template = template.get('initialization', '')
-        media_template = template.get('media', '')
-
-        timescale = int(template.get('timescale', 1))
-        duration = template.get('duration')
-        duration = int(duration) if duration is not None else None
-        start_number = int(template.get('startNumber', 1))
-
-        init_url = DashParser._fill_template(init_template, rep_id, start_number, 0, bandwidth)
-        init_url = urljoin(base_url, init_url)
-
-        segments: List[DashSegment] = []
-
-        timeline = template.find('.//mpd:SegmentTimeline', namespaces=DashParser.DASH_NS)
-        if timeline is not None:
-            segments = DashParser._parse_segment_timeline(
-                timeline,
-                media_template,
-                rep_id,
-                base_url,
-                bandwidth,
-                timescale,
-                start_number,
-            )
-        elif duration is not None and duration > 0:
-            segment_duration = duration / timescale
-            if total_duration and segment_duration > 0:
-                num_segments = max(1, math.ceil(total_duration / segment_duration))
-            else:
-                num_segments = 200
-
-            for i in range(num_segments):
-                seg_num = start_number + i
-                seg_url = DashParser._fill_template(media_template, rep_id, seg_num, 0, bandwidth)
-                seg_url = urljoin(base_url, seg_url)
-
-                segments.append(
-                    DashSegment(
-                        url=seg_url,
-                        duration=segment_duration,
-                        number=seg_num,
-                    )
-                )
-
-        return init_url, segments
-
-    @staticmethod
-    def _parse_segment_timeline(timeline, media_template: str, rep_id: str, base_url: str, bandwidth: int, timescale: int, start_number: int) -> List[DashSegment]:
-        """Parse SegmentTimeline element."""
-        segments = []
-        time = 0
-        number = start_number
-
-        for s in timeline.findall('.//mpd:S', namespaces=DashParser.DASH_NS):
-            t = s.get('t')
-            if t is not None:
-                time = int(t)
-
-            d = int(s.get('d', 0))
-            r = int(s.get('r', 0))
-
-            for _ in range(r + 1):
-                seg_url = DashParser._fill_template(media_template, rep_id, number, time, bandwidth)
-                seg_url = urljoin(base_url, seg_url)
-
-                segments.append(
-                    DashSegment(
-                        url=seg_url,
-                        duration=d / timescale,
-                        number=number,
-                    )
-                )
-
-                time += d
-                number += 1
-
-        return segments
-
-    @staticmethod
-    def _parse_segment_list(segment_list, base_url: str) -> tuple:
-        """Parse SegmentList element."""
-        init_elem = segment_list.find('.//mpd:Initialization', namespaces=DashParser.DASH_NS)
-        init_url = urljoin(base_url, init_elem.get('sourceURL', '')) if init_elem is not None else ''
-        
-        segments = []
-        duration = float(segment_list.get('duration', 1.0))
-        
-        for idx, seg_url_elem in enumerate(segment_list.findall('.//mpd:SegmentURL', namespaces=DashParser.DASH_NS)):
-            media_url = seg_url_elem.get('media', '')
-            media_url = urljoin(base_url, media_url)
-            
-            segments.append(DashSegment(
-                url=media_url,
-                duration=duration,
-                number=idx + 1
-            ))
-        
-        return init_url, segments
-
-    @staticmethod
-    def _fill_template(template: str, rep_id: str, number: int, time: int, bandwidth: int) -> str:
-        """Fill in template variables."""
-        result = template
-        result = result.replace('$RepresentationID$', rep_id)
-        result = result.replace('$Number$', str(number))
-        result = result.replace('$Time$', str(time))
-        result = result.replace('$Bandwidth$', str(bandwidth))
-        
-        format_pattern = r'\$(\w+)%0(\d+)d\$'
-        
-        def replace_format(match):
-            var_name = match.group(1)
-            width = int(match.group(2))
-            
-            if var_name == 'Number':
-                return str(number).zfill(width)
-            elif var_name == 'Time':
-                return str(time).zfill(width)
-            else:
-                return match.group(0)
-        
-        result = re.sub(format_pattern, replace_format, result)
-        
-        return result
-
-    @staticmethod
     def _parse_duration(duration_str: str) -> float:
-        """Parse ISO 8601 duration string to seconds."""
         if not duration_str:
             return 0.0
-        
-        pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?'
-        match = re.match(pattern, duration_str)
-        
+
+        pattern = (
+            r"P"
+            r"(?:(?P<years>\d+)Y)?"
+            r"(?:(?P<months>\d+)M)?"
+            r"(?:(?P<days>\d+)D)?"
+            r"(?:T"
+            r"(?:(?P<hours>\d+)H)?"
+            r"(?:(?P<minutes>\d+)M)?"
+            r"(?:(?P<seconds>[\d.]+)S)?"
+            r")?"
+        )
+        match = re.fullmatch(pattern, duration_str)
         if not match:
-            return 0.0
-        
-        hours = int(match.group(1) or 0)
-        minutes = int(match.group(2) or 0)
-        seconds = float(match.group(3) or 0)
-        
-        return hours * 3600 + minutes * 60 + seconds
+            # Fallback to PT... format
+            alt_pattern = r"PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?"
+            alt_match = re.fullmatch(alt_pattern, duration_str)
+            if not alt_match:
+                return 0.0
+            hours = int(alt_match.group(1) or 0)
+            minutes = int(alt_match.group(2) or 0)
+            seconds = float(alt_match.group(3) or 0)
+            return hours * 3600 + minutes * 60 + seconds
+
+        years = int(match.group("years") or 0)
+        months = int(match.group("months") or 0)
+        days = int(match.group("days") or 0)
+        hours = int(match.group("hours") or 0)
+        minutes = int(match.group("minutes") or 0)
+        seconds = float(match.group("seconds") or 0)
+
+        total_days = years * 365 + months * 30 + days
+        return total_days * 86400 + hours * 3600 + minutes * 60 + seconds
