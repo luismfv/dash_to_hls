@@ -9,6 +9,8 @@ A high-performance Python backend that converts MPEG-DASH streams to HLS format 
 - 🎬 **Generates fMP4-based HLS playlists** from decrypted segments
 - ⚡ **Concurrently manage multiple DASH streams** with async I/O
 - 🌐 **HTTP REST API** powered by Quart and served by Hypercorn
+- 🖥️ **Bootstrap web UI** to monitor lives and add/remove streams in real time
+- 🔊 **Automatically selects the highest quality video & audio representations** (no subtitles)
 - 💻 **CLI tooling** for easy stream management
 - 🔄 **Support for both VOD and live streams**
 - 🎯 **Representation selection** by bandwidth, resolution, or ID
@@ -52,6 +54,10 @@ Or specify a custom host and port:
 ```bash
 uv run hypercorn dash2hls.server:app --bind 0.0.0.0:8080
 ```
+
+Once running, open your browser to:
+- **Web UI**: `http://localhost:8000/` — Add, remove, and monitor lives in real time
+- **API Docs**: `http://localhost:8000/api` — View available endpoints
 
 ## CLI Commands
 
@@ -198,16 +204,21 @@ When adding a stream via API, you can configure:
 
 ## Output Structure
 
-Each stream creates its own directory under `output/`:
+Each stream creates its own directory under `output/`, with separate variants for video and audio:
 
 ```
 output/
 └── <stream-id>/
-    ├── master.m3u8          # Master playlist
-    ├── index.m3u8           # Media playlist
-    ├── init.mp4             # Initialization segment
-    ├── segment_0.m4s        # Media segments
+    ├── master.m3u8          # Master playlist (multi-variant)
+    ├── index.m3u8           # Video media playlist
+    ├── init.mp4             # Video initialization segment
+    ├── segment_0.m4s        # Video media segments
     ├── segment_1.m4s
+    ├── audio/
+    │   ├── index.m3u8       # Audio media playlist
+    │   ├── init.mp4         # Audio initialization segment
+    │   ├── segment_0.m4s    # Audio media segments
+    │   └── segment_1.m4s
     └── ...
 ```
 
