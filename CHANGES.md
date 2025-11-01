@@ -10,9 +10,10 @@ This implementation adds three major features to the dash2hls project:
 ## Changes Made
 
 ### 1. Real-Time mp4decrypt Decryption (decryptor.py)
-- **Before**: mp4decrypt used temporary files for input/output
-- **After**: Uses stdin/stdout pipes (`-` flag) for truly real-time streaming decryption
-- **Benefit**: Eliminates disk I/O overhead, faster processing, no temporary file cleanup
+- **Implementation**: Uses temporary files for input/output instead of stdin/stdout pipes
+- **Reason**: Stdin/stdout pipes (`-` flag) proved unreliable across different mp4decrypt versions
+- **Error Fixed**: "ERROR: cannot open input file (-) -4" error resolved
+- **Benefit**: More reliable decryption across different environments and mp4decrypt versions
 
 ### 2. Multi-Variant HLS Support (hls_writer.py, hls_generator.py)
 - **New Class**: `MultiVariantHLSWriter` manages separate video + audio variants

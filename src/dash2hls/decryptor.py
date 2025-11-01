@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Protocol
 
 
@@ -70,36 +73,67 @@ class Mp4DecryptBinary(Decryptor):
 
         key = self.key_map[kid]
 
-        command = [
-            self.executable,
-            "--key",
-            f"{kid}:{key}",
-            "-",
-            "-",
-        ]
+        # Use temp files instead of pipes for better reliability
+        enc_fd, enc_path = tempfile.mkstemp(suffix=".enc.mp4")
+        try:
+            with os.fdopen(enc_fd, "wb") as enc_file:
+                enc_file.write(data)
+        except Exception:
+            os.close(enc_fd)
+            raise
 
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate(input=data)
+        dec_fd, dec_path = tempfile.mkstemp(suffix=".dec.mp4")
+        os.close(dec_fd)
+        try:
+            os.unlink(dec_path)
+        except FileNotFoundError:
+            pass
 
-        if process.returncode != 0:
-            raise DecryptionError(
-                f"mp4decrypt failed (exit code {process.returncode}).\n"
-                f"STDOUT: {stdout.decode(errors='ignore')}\n"
-                f"STDERR: {stderr.decode(errors='ignore')}"
+        try:
+            command = [
+                self.executable,
+                "--key",
+                f"{kid}:{key}",
+                enc_path,
+                dec_path,
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            stdout, stderr = await process.communicate()
 
-        if not stdout:
-            stderr_text = stderr.decode(errors="ignore")
-            raise DecryptionError(
-                "mp4decrypt produced no output" + (f". STDERR: {stderr_text}" if stderr_text else "")
-            )
+            if process.returncode != 0:
+                raise DecryptionError(
+                    f"mp4decrypt failed (exit code {process.returncode}).\n"
+                    f"STDOUT: {stdout.decode(errors='ignore')}\n"
+                    f"STDERR: {stderr.decode(errors='ignore')}"
+                )
 
-        return stdout
+            # Read decrypted output
+            dec_path_obj = Path(dec_path)
+            if not dec_path_obj.exists() or dec_path_obj.stat().st_size == 0:
+                stderr_text = stderr.decode(errors="ignore")
+                raise DecryptionError(
+                    "mp4decrypt produced no output" + (f". STDERR: {stderr_text}" if stderr_text else "")
+                )
+
+            with open(dec_path, "rb") as f:
+                decrypted_data = f.read()
+
+            return decrypted_data
+        finally:
+            # Clean up temp files
+            try:
+                os.unlink(enc_path)
+            except FileNotFoundError:
+                pass
+            try:
+                os.unlink(dec_path)
+            except FileNotFoundError:
+                pass
 
 
 def build_decryptor(
