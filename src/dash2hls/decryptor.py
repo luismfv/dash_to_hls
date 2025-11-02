@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Protocol
 
 
@@ -57,6 +60,9 @@ class Mp4DecryptBinary(Decryptor):
         return key
 
     async def decrypt_segment(self, data: bytes, *, kid: Optional[str] = None) -> bytes:
+        if not data:
+            raise DecryptionError("Cannot decrypt empty data")
+
         if kid:
             kid = self._normalize_kid(kid)
             if kid not in self.key_map:
@@ -70,36 +76,55 @@ class Mp4DecryptBinary(Decryptor):
 
         key = self.key_map[kid]
 
-        command = [
-            self.executable,
-            "--key",
-            f"{kid}:{key}",
-            "-",
-            "-",
-        ]
+        # Use temporary files instead of stdin/stdout pipes for better compatibility
+        # with different versions of mp4decrypt
+        temp_dir = None
+        try:
+            # Create temporary directory
+            temp_dir = tempfile.mkdtemp(prefix="dash2hls_decrypt_")
+            input_path = Path(temp_dir) / "encrypted.mp4"
+            output_path = Path(temp_dir) / "decrypted.mp4"
 
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate(input=data)
+            # Write encrypted data to temp file
+            input_path.write_bytes(data)
 
-        if process.returncode != 0:
-            raise DecryptionError(
-                f"mp4decrypt failed (exit code {process.returncode}).\n"
-                f"STDOUT: {stdout.decode(errors='ignore')}\n"
-                f"STDERR: {stderr.decode(errors='ignore')}"
+            command = [
+                self.executable,
+                "--key",
+                f"{kid}:{key}",
+                str(input_path),
+                str(output_path),
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            stdout, stderr = await process.communicate()
 
-        if not stdout:
-            stderr_text = stderr.decode(errors="ignore")
-            raise DecryptionError(
-                "mp4decrypt produced no output" + (f". STDERR: {stderr_text}" if stderr_text else "")
-            )
+            if process.returncode != 0:
+                raise DecryptionError(
+                    f"mp4decrypt failed (exit code {process.returncode}).\n"
+                    f"STDOUT: {stdout.decode(errors='ignore')}\n"
+                    f"STDERR: {stderr.decode(errors='ignore')}"
+                )
 
-        return stdout
+            if not output_path.exists():
+                raise DecryptionError(f"mp4decrypt did not create output file: {output_path}")
+
+            # Read decrypted data
+            decrypted_data = output_path.read_bytes()
+
+            if not decrypted_data:
+                raise DecryptionError("mp4decrypt produced empty output")
+
+            return decrypted_data
+
+        finally:
+            # Clean up temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def build_decryptor(
